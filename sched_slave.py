@@ -2,12 +2,11 @@
 
 import getopt
 import sys, os, pwd
-import socket
+import socket, ssl
 import subprocess
 import threading
 import pyinotify
 import datetime as dt
-import SimpleCrypt as sc
 
 if sys.version_info[0] >= 3:
    import pickle
@@ -23,8 +22,9 @@ os.umask(0o077)
 ####################################################################
 
 # Server key. This string has to be identical to the key on the master
-secret_key = "yourrandomstringhere"
-
+CA_cert = 'CA.key'
+master_certfile = 'master.crt'
+agent_certfile = 'agent.crt'
 agent_port = 999
 event_port = 998
 
@@ -34,8 +34,6 @@ master_host = 'localhost'
 
 
 #Globals
-incrypt = sc.SimpleCrypt(INITKEY=secret_key, DEBUG=False, CYCLES=3, BLOCK_SZ=25, KEY_ADV=5, KEY_MAGNITUDE=1)
-outcrypt = sc.SimpleCrypt(INITKEY=secret_key, DEBUG=False, CYCLES=3, BLOCK_SZ=25, KEY_ADV=5, KEY_MAGNITUDE=1)
 event_queue = {}
 lock = threading.Lock()
 process_list = {} # list of current processes. useful for cleanup. 
@@ -115,11 +113,11 @@ def send_event(event, path, filename=""):
    hostname = socket.gethostname()
    Log("Sending Event %s for %s" % (event, filename))
    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-   client_socket.connect((master_host, event_port))
-   command = cPickle.dumps([event, hostname, path, filename])
-   cipher = outcrypt.Encrypt(command)
-   client_socket.send(cipher)
-   client_socket.close()
+   ssl_socket = ssl.wrap_socket(s, ca_certs=agent_certfile, cert_reqs=ssl.CERT_REQUIRED, ssl_version=ssl.PROTOCOL_TLSv1)
+   ssl_socket.connect((master_host, event_port))
+   evrnt_data = cPickle.dumps([event, hostname, path, filename])
+   ssl_socket.send(evrnt_data)
+   ssl_socket.close()
 
 class ModHandler(pyinotify.ProcessEvent):
     # evt has useful properties, including pathname
@@ -147,22 +145,42 @@ class EventThread(threading.Thread):
          return
       notifier.loop()
 
-class EchoRequestHandler(SocketServer.BaseRequestHandler ):
+class SecureTCPServer(SocketServer.TCPServer):
+    def __init__(self,
+                 server_address,
+                 RequestHandlerClass,
+                 certfile,
+                 keyfile,
+                 ssl_version=ssl.PROTOCOL_TLSv1,
+                 bind_and_activate=True):
+        TCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate)
+        self.certfile = certfile
+        self.keyfile = keyfile
+        self.ssl_version = ssl_version
+
+    def get_request(self):
+        newsocket, fromaddr = self.socket.accept()
+        connstream = ssl.wrap_socket(newsocket,
+                                 server_side=True,
+                                 certfile = self.certfile,
+                                 keyfile = self.keyfile,
+                                 ssl_version = self.ssl_version)
+        return connstream, fromaddr
+
+class Secure_ThreadingTCPServer(ThreadingMixIn, MySSL_TCPServer): pass
+
+class RequestHandler(SocketServer.BaseRequestHandler ):
    def setup(self):
       #print self.client_address, 'connected!'
       pass
 
    def send_data(self, data):
-      self.request.send(data)
+      self.request.send(cPicke.dumps(data))
 
-   def encrypt_and_send(self, data):
-      out_cipher = outcrypt.Encrypt(cPickle.dumps(data))
-      self.send_data(out_cipher)
-            
    def handle(self):
-      cipher = self.request.recv(1024)
+      rawdata = self.connection.recv(4096)
 #      try:
-      cmd = cPickle.loads(incrypt.Decrypt(cipher))
+      cmd = cPickle.loads(rawdata)
       #print cmd
       if cmd[0].startswith('ON_'):
          Log("Received %s event for file %s" % (cmd[0], cmd[1]))
@@ -181,13 +199,13 @@ class EchoRequestHandler(SocketServer.BaseRequestHandler ):
          pid = proc.pid
          #process_list['%s' % (pid)] = 0
          sendpid = [proc.pid, ]
-         self.encrypt_and_send(sendpid)
+         self.send_data(sendpid)
          # Now send the return code and the output up to the master. 
          output = proc.communicate()[0]
          return_code = proc.returncode
          #process_list.pop(pid)
          response = [return_code, output]
-         self.encrypt_and_send(response)
+         self.send_data(response)
 #      except UnpicklingError:
 #         Log("Host key does not match. Permission denied.")
 
@@ -220,7 +238,7 @@ def main():
       elif o in ['-h', '--help']:
          usage()
    SocketServer.ThreadingTCPServer.allow_reuse_address = True
-   server = SocketServer.ThreadingTCPServer(('', agent_port), EchoRequestHandler)
+   server = Secure_ThreadingTCPServer((bind_address, agent_port), RequestHandler, master_certfile, CA_cert)
    server.serve_forever()
 
 if __name__ == '__main__':

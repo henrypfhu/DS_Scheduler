@@ -28,8 +28,13 @@ peers = { '192.168.50.4':             '',
 # Preferred master MUST mastch on all scheduler masters else bad things happen. 
 preferred_master = '192.168.50.4'
 
-#Crypto / host key This has to match the slaves
-secret_key = "yourrandomstringhere"
+#SSL
+master_certfile = 'master.crt'
+agent_certfile = 'agent.crt'
+CA_cert = 'CA.key'
+
+# Logging
+logfile = '/var/log/DSscheduler.log'
 
 # Command to run when job fail
 # possible to set 2 parameters : job name and return code

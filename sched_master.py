@@ -1,7 +1,7 @@
 #!/usr/bin/env python2
 
 import sys, os
-import socket, threading, time
+import socket, ssl, threading, time
 import SocketServer
 import string
 import random
@@ -12,14 +12,11 @@ from datetime import datetime, timedelta
 from apscheduler.scheduler import Scheduler
 from email.mime.text import MIMEText
 import MySQLdb
-import SimpleCrypt as sc
 import sched_config as conf
 from pprint import pprint
 
 #Global defs
 logging.basicConfig()
-incrypt = sc.SimpleCrypt(INITKEY=conf.secret_key, DEBUG=False, CYCLES=3, BLOCK_SZ=25, KEY_ADV=5, KEY_MAGNITUDE=1)
-outcrypt = sc.SimpleCrypt(INITKEY=conf.secret_key, DEBUG=False, CYCLES=3, BLOCK_SZ=25, KEY_ADV=5, KEY_MAGNITUDE=1)
 myself = socket.gethostbyname(socket.gethostname())
 lock = threading.Lock()
 
@@ -34,6 +31,30 @@ def Log(msg):
    if __name__ == "__main__":
       now = dt.datetime.now()
       print "%s :: %s" %(now, msg)
+
+class SecureTCPServer(SocketServer.TCPServer):
+    def __init__(self,
+                 server_address,
+                 RequestHandlerClass,
+                 certfile,
+                 keyfile,
+                 ssl_version=ssl.PROTOCOL_TLSv1,
+                 bind_and_activate=True):
+        TCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate)
+        self.certfile = certfile
+        self.keyfile = keyfile
+        self.ssl_version = ssl_version
+
+    def get_request(self):
+        newsocket, fromaddr = self.socket.accept()
+        connstream = ssl.wrap_socket(newsocket,
+                                 server_side=True,
+                                 certfile = self.certfile,
+                                 keyfile = self.keyfile,
+                                 ssl_version = self.ssl_version)
+        return connstream, fromaddr
+
+class Secure_ThreadingTCPServer(ThreadingMixIn, MySSL_TCPServer): pass
 
 class Heartbeats(dict):
    """Manage shared heartbeats dictionary with thread locking"""
@@ -105,8 +126,8 @@ class Event_Receiver(SocketServer.BaseRequestHandler):
 
    def handle(self):
       util = Util()
-      cipher = self.request.recv(1024)
-      event = cPickle.loads(incrypt.Decrypt(cipher))
+      ev_in = self.connection.recv(1024)
+      event = cPickle.loads(ev_in)
       e_type = event[0]
       host = event[1]
       path = event[2]
@@ -118,7 +139,7 @@ class EventEngine(threading.Thread):
    def run(self):
       #This 'event_engine' is for the remote trigger events.
       SocketServer.ThreadingTCPServer.allow_reuse_address = True
-      server = SocketServer.ThreadingTCPServer(('', conf.event_port), Event_Receiver)
+      server = Secure_ThreadingTCPServer(('', conf.event_port), Event_Receiver, conf.master_certfile, conf.CA_cert)
       # Start a thread with the server -- that thread will then start one more thread for each request
       #server_thread = threading.Thread(target=server.serve_forever)
       Log("Started Event engine.")
@@ -230,8 +251,9 @@ class Util:
       else:
          Log("Running job %s on host %s" % (job_name, host))
       client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      ssl_socket = ssl.wrap_socket(s, ca_certs="agent.crt", cert_reqs=ssl.CERT_REQUIRED, ssl_version=ssl.PROTOCOL_TLSv1) 
       try:
-         client_socket.connect((host, conf.agent_port))
+         ssl_socket.connect((host, conf.agent_port))
       except:
          #[Errno 113] No route to host or agent is offline. Let's flag that. 
          Log("Job %s Failed:" % (job_id))
@@ -239,13 +261,11 @@ class Util:
          self.runErrorCommand(job_name, 99994)
          return None
       command = cPickle.dumps([cmd, user])
-      cipher = outcrypt.Encrypt(command)
-      client_socket.send(cipher)
+      ssl_socket.send(command)
       if cmd.startswith('ON_'):
          return None
       # Lets get the PID so that we can manage the process.
-      rawcipher = client_socket.recv(10240)
-      rawdata = incrypt.Decrypt(rawcipher)
+      rawdata = ssl_socket.recv(10240)
       try:
          data = cPickle.loads(rawdata)
       except UnpicklingError:
@@ -257,8 +277,7 @@ class Util:
          self.runQuery("update jobs set start_time=now(),status=99998, pid=%s where id=%s" % (pid, job_id))
          self.runQuery("insert into results VALUES(%s, now(), NULL, NULL, '%s', 99999)" % (job_id, unique_id))
 
-      rawcipher = client_socket.recv(10240)
-      rawdata = incrypt.Decrypt(rawcipher)
+      rawdata = ssl_socket.recv(10240)
      
       try:
          data = cPickle.loads(rawdata)
