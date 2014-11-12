@@ -28,9 +28,13 @@ peers = { '192.168.50.4':             '',
 # Preferred master MUST mastch on all scheduler masters else bad things happen. 
 preferred_master = '192.168.50.4'
 
-#SSL
-master_certfile = 'master.crt'
-agent_certfile = 'agent.crt'
+# This is where your installation should live. Point this to where ever
+# You decide to move it to. 
+sched_basedir = '/opt/scheduler'
+
+# SSL info. Should not need to change these
+ssl_dir = os.path.join(sched_basedir, 'ssl')
+master_certfile = 'agent.crt'
 CA_cert = 'CA.key'
 
 # Logging

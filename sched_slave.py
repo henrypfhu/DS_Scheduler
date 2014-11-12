@@ -7,6 +7,9 @@ import subprocess
 import threading
 import pyinotify
 import datetime as dt
+import sched_slaveconfig as conf
+from OpenSSL import crypto, SSL
+#from time import gmtime, mktime
 
 if sys.version_info[0] >= 3:
    import pickle
@@ -17,26 +20,14 @@ else:
 
 os.umask(0o077)
 
-####################################################################
-# Scheduler configuration
-####################################################################
-
-# Server key. This string has to be identical to the key on the master
-CA_cert = 'CA.key'
-master_certfile = 'master.crt'
-agent_certfile = 'agent.crt'
-agent_port = 999
-event_port = 998
-
-master_host = 'localhost'
-####################################################################
-####################################################################
-
+import sched_slaveconfig as conf
 
 #Globals
 event_queue = {}
 lock = threading.Lock()
 process_list = {} # list of current processes. useful for cleanup. 
+C_F = os.path.join(conf.ssl_dir, conf.agent_certfile)
+K_F = os.path.join(conf.ssl_dir, conf.CA_cert)
 
 def usage():
 
@@ -49,46 +40,69 @@ Options:
 ''')
 
 def daemonize (stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
+   '''This forks the current process into a daemon. The stdin, stdout, and
+   stderr arguments are file names that will be opened and be used to replace
+   the standard file descriptors in sys.stdin, sys.stdout, and sys.stderr.
+   These arguments are optional and default to /dev/null. Note that stderr is
+   opened unbuffered, so if it shares a file with stdout then interleaved
+   output may not appear in the order that you expect. '''
 
-    '''This forks the current process into a daemon. The stdin, stdout, and
-    stderr arguments are file names that will be opened and be used to replace
-    the standard file descriptors in sys.stdin, sys.stdout, and sys.stderr.
-    These arguments are optional and default to /dev/null. Note that stderr is
-    opened unbuffered, so if it shares a file with stdout then interleaved
-    output may not appear in the order that you expect. '''
+   # Do first fork.
+   try: 
+      pid = os.fork() 
+      if pid > 0:
+         sys.exit(0)   # Exit first parent.
+   except OSError as e: 
+      sys.stderr.write ("fork #1 failed: (%d) %s\n" % (e.errno, e.strerror) )
+      sys.exit(1)
 
-    # Do first fork.
-    try: 
-        pid = os.fork() 
-        if pid > 0:
-            sys.exit(0)   # Exit first parent.
-    except OSError as e: 
-        sys.stderr.write ("fork #1 failed: (%d) %s\n" % (e.errno, e.strerror) )
-        sys.exit(1)
+   # Decouple from parent environment.
+   os.chdir("/") 
+   os.umask(0) 
+   os.setsid() 
 
-    # Decouple from parent environment.
-    os.chdir("/") 
-    os.umask(0) 
-    os.setsid() 
+   # Do second fork.
+   try: 
+      pid = os.fork() 
+      if pid > 0:
+         sys.exit(0)   # Exit second parent.
+   except OSError as e: 
+      sys.stderr.write ("fork #2 failed: (%d) %s\n" % (e.errno, e.strerror) )
+      sys.exit(1)
 
-    # Do second fork.
-    try: 
-        pid = os.fork() 
-        if pid > 0:
-            sys.exit(0)   # Exit second parent.
-    except OSError as e: 
-        sys.stderr.write ("fork #2 failed: (%d) %s\n" % (e.errno, e.strerror) )
-        sys.exit(1)
-
-    # Now I am a daemon!
+   # Now I am a daemon!
     
-    # Redirect standard file descriptors.
-    si = open(stdin, 'r')
-    so = open(stdout, 'a+')
-    se = open(stderr, 'a+', 0)
-    os.dup2(si.fileno(), sys.stdin.fileno())
-    os.dup2(so.fileno(), sys.stdout.fileno())
-    os.dup2(se.fileno(), sys.stderr.fileno())
+   # Redirect standard file descriptors.
+   si = open(stdin, 'r')
+   so = open(stdout, 'a+')
+   se = open(stderr, 'a+', 0)
+   os.dup2(si.fileno(), sys.stdin.fileno())
+   os.dup2(so.fileno(), sys.stdout.fileno())
+   os.dup2(se.fileno(), sys.stderr.fileno())
+
+def create_self_signed_cert():
+   global C_F
+   global K_F
+   # create a key pair
+   k = crypto.PKey()
+   k.generate_key(crypto.TYPE_RSA, 1024)
+
+   # create a self-signed cert
+   cert = crypto.X509()
+   cert.get_subject().C = 'US'
+   cert.get_subject().ST = 'NY'
+   cert.get_subject().L = 'Somwhere'
+   cert.get_subject().O = 'DS_Scheduler'
+   cert.get_subject().OU = 'DS_Scheduler'
+   cert.get_subject().CN = 'agent'
+   cert.set_serial_number(1000)
+   cert.gmtime_adj_notBefore(0)
+   cert.gmtime_adj_notAfter(315360000)
+   cert.set_issuer(cert.get_subject())
+   cert.set_pubkey(k)
+   cert.sign(k, 'sha1')
+   open(C_F, 'wt').write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+   open(K_F, 'wt').write(crypto.dump_privatekey(crypto.FILETYPE_PEM, k))
 
 def demote(user_uid):
    def result():
@@ -110,13 +124,15 @@ def add_queue(event, target):
       return True
 
 def send_event(event, path, filename=""):
+   global C_F
+   global K_F
    hostname = socket.gethostname()
    Log("Sending Event %s for %s" % (event, filename))
    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-   ssl_socket = ssl.wrap_socket(s, ca_certs=agent_certfile, cert_reqs=ssl.CERT_REQUIRED, ssl_version=ssl.PROTOCOL_TLSv1)
-   ssl_socket.connect((master_host, event_port))
-   evrnt_data = cPickle.dumps([event, hostname, path, filename])
-   ssl_socket.send(evrnt_data)
+   ssl_socket = ssl.wrap_socket(client_socket, ca_certs=C_F, cert_reqs=ssl.CERT_REQUIRED, ssl_version=ssl.PROTOCOL_TLSv1)
+   ssl_socket.connect((conf.master_host, event_port))
+   event_data = cPickle.dumps([event, hostname, path, filename])
+   ssl_socket.send(event_data)
    ssl_socket.close()
 
 class ModHandler(pyinotify.ProcessEvent):
@@ -153,7 +169,8 @@ class SecureTCPServer(SocketServer.TCPServer):
                  keyfile,
                  ssl_version=ssl.PROTOCOL_TLSv1,
                  bind_and_activate=True):
-        TCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate)
+        
+        SocketServer.TCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate)
         self.certfile = certfile
         self.keyfile = keyfile
         self.ssl_version = ssl_version
@@ -167,7 +184,7 @@ class SecureTCPServer(SocketServer.TCPServer):
                                  ssl_version = self.ssl_version)
         return connstream, fromaddr
 
-class Secure_ThreadingTCPServer(ThreadingMixIn, MySSL_TCPServer): pass
+class Secure_ThreadingTCPServer(SocketServer.ThreadingMixIn, SecureTCPServer): pass
 
 class RequestHandler(SocketServer.BaseRequestHandler ):
    def setup(self):
@@ -175,10 +192,10 @@ class RequestHandler(SocketServer.BaseRequestHandler ):
       pass
 
    def send_data(self, data):
-      self.request.send(cPicke.dumps(data))
+      self.request.send(cPickle.dumps(data))
 
    def handle(self):
-      rawdata = self.connection.recv(4096)
+      rawdata = self.request.recv(4096)
 #      try:
       cmd = cPickle.loads(rawdata)
       #print cmd
@@ -210,6 +227,14 @@ class RequestHandler(SocketServer.BaseRequestHandler ):
 #         Log("Host key does not match. Permission denied.")
 
 def main():
+   global C_F
+   global K_F
+  
+   if not os.path.exists(conf.ssl_dir):
+      os.mkdir(conf.ssl_dir, 0700)
+   if not os.path.exists(C_F) or not os.path.exists(K_F):
+      create_self_signed_cert()
+
    try:
       opts, args = getopt.getopt(sys.argv[1:], "ho:v", ["help", "output="])
    except getopt.GetoptError as err:
@@ -238,7 +263,7 @@ def main():
       elif o in ['-h', '--help']:
          usage()
    SocketServer.ThreadingTCPServer.allow_reuse_address = True
-   server = Secure_ThreadingTCPServer((bind_address, agent_port), RequestHandler, master_certfile, CA_cert)
+   server = Secure_ThreadingTCPServer((conf.bind_address, conf.agent_port), RequestHandler, C_F, K_F)
    server.serve_forever()
 
 if __name__ == '__main__':

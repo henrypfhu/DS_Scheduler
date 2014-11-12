@@ -14,11 +14,14 @@ from email.mime.text import MIMEText
 import MySQLdb
 import sched_config as conf
 from pprint import pprint
+from OpenSSL import crypto, SSL
 
 #Global defs
 logging.basicConfig()
 myself = socket.gethostbyname(socket.gethostname())
 lock = threading.Lock()
+C_F = os.path.join(conf.ssl_dir, conf.master_certfile)
+K_F = os.path.join(conf.ssl_dir, conf.CA_cert)
 
 def id_generator(size=32, chars=string.ascii_uppercase + string.digits):
    return ''.join(random.choice(chars) for x in range(size))
@@ -32,6 +35,30 @@ def Log(msg):
       now = dt.datetime.now()
       print "%s :: %s" %(now, msg)
 
+def create_self_signed_cert():
+   global C_F
+   global K_F
+   # create a key pair
+   k = crypto.PKey()
+   k.generate_key(crypto.TYPE_RSA, 1024)
+
+   # create a self-signed cert
+   cert = crypto.X509()
+   cert.get_subject().C = 'US'
+   cert.get_subject().ST = 'NY'
+   cert.get_subject().L = 'Somwhere'
+   cert.get_subject().O = 'DS_Scheduler'
+   cert.get_subject().OU = 'DS_Scheduler'
+   cert.get_subject().CN = 'master'
+   cert.set_serial_number(1000)
+   cert.gmtime_adj_notBefore(0)
+   cert.gmtime_adj_notAfter(315360000)
+   cert.set_issuer(cert.get_subject())
+   cert.set_pubkey(k)
+   cert.sign(k, 'sha1')
+   open(C_F, 'wt').write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+   open(K_F, 'wt').write(crypto.dump_privatekey(crypto.FILETYPE_PEM, k))
+
 class SecureTCPServer(SocketServer.TCPServer):
     def __init__(self,
                  server_address,
@@ -40,7 +67,8 @@ class SecureTCPServer(SocketServer.TCPServer):
                  keyfile,
                  ssl_version=ssl.PROTOCOL_TLSv1,
                  bind_and_activate=True):
-        TCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate)
+        SocketServer.ThreadingTCPServer.allow_reuse_address = True
+        SocketServer.TCPServer.__init__(self, server_address, RequestHandlerClass, bind_and_activate)
         self.certfile = certfile
         self.keyfile = keyfile
         self.ssl_version = ssl_version
@@ -54,7 +82,7 @@ class SecureTCPServer(SocketServer.TCPServer):
                                  ssl_version = self.ssl_version)
         return connstream, fromaddr
 
-class Secure_ThreadingTCPServer(ThreadingMixIn, MySSL_TCPServer): pass
+class Secure_ThreadingTCPServer(SocketServer.ThreadingMixIn, SecureTCPServer): pass
 
 class Heartbeats(dict):
    """Manage shared heartbeats dictionary with thread locking"""
@@ -137,9 +165,10 @@ class Event_Receiver(SocketServer.BaseRequestHandler):
 
 class EventEngine(threading.Thread):
    def run(self):
+      global C_F
+      global K_F
       #This 'event_engine' is for the remote trigger events.
-      SocketServer.ThreadingTCPServer.allow_reuse_address = True
-      server = Secure_ThreadingTCPServer(('', conf.event_port), Event_Receiver, conf.master_certfile, conf.CA_cert)
+      server = Secure_ThreadingTCPServer(('', conf.event_port), Event_Receiver, C_F, K_F)
       # Start a thread with the server -- that thread will then start one more thread for each request
       #server_thread = threading.Thread(target=server.serve_forever)
       Log("Started Event engine.")
@@ -194,8 +223,8 @@ class Util:
       return result
 
    def init_path(self):
-      if not os.path.isfile('/var/log/scheduler_web.log'):
-         os.system('touch /var/log/scheduler_web.log')
+      if not os.path.isfile(conf.logfile):
+         os.system('touch %s' % (conf.logfile))
 
    def init_DB(self):
       current_db_version = 4
@@ -245,13 +274,15 @@ class Util:
       return events
 
    def remote_command(self, job_id, host, cmd, user, job_name):
+      global C_F
+      global K_F
       unique_id = id_generator()
       if cmd.startswith('kill'):
          Log("Killing job %s on host %s" % (job_name, host))
       else:
          Log("Running job %s on host %s" % (job_name, host))
       client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      ssl_socket = ssl.wrap_socket(s, ca_certs="agent.crt", cert_reqs=ssl.CERT_REQUIRED, ssl_version=ssl.PROTOCOL_TLSv1) 
+      ssl_socket = ssl.wrap_socket(client_socket, ca_certs=C_F, cert_reqs=ssl.CERT_REQUIRED, ssl_version=ssl.PROTOCOL_TLSv1) 
       try:
          ssl_socket.connect((host, conf.agent_port))
       except:
@@ -498,7 +529,16 @@ class DS_Scheduler:
 
       self.sched.shutdown()
 
-if __name__ == "__main__":
+def main():
+   global C_F
+   global K_F
+
+   # Generate a cert for the master if we do not have one yet.
+   if not os.path.exists(conf.ssl_dir):
+      os.mkdir(conf.ssl_dir, 0700)
+   if not os.path.exists(C_F) or not os.path.exists(K_F):
+      create_self_signed_cert()
+
    os.umask(077)
    if conf.clustering == True:
       #This 'Event' is for Cluster heartbeats
@@ -520,3 +560,6 @@ if __name__ == "__main__":
       Log("Shutting Down")
       event_engine.shutdown()
       #server.shutdown()
+
+if __name__ == "__main__":
+   main()
